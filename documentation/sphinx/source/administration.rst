@@ -85,7 +85,7 @@ Specifying the cluster file
 All FoundationDB components can be configured to use a specified cluster file: 
 
 * The ``fdbcli`` tool allows a cluster file to be passed on the command line using the ``-C`` option.
-* The :doc:`client APIs <api-reference>` allow a cluster file to be passed when connecting to a cluster, usually via ``open()`` or ``create_cluster()``.
+* The :doc:`client APIs <api-reference>` allow a cluster file to be passed when connecting to a cluster, usually via ``open()``.
 * A FoundationDB server or ``backup-agent`` allow a cluster file to be specified in :ref:`foundationdb.conf <foundationdb-conf>`.
 
 In addition, FoundationDB allows you to use the environment variable ``FDB_CLUSTER_FILE`` to specify a cluster file. This approach is helpful if you operate or access more than one cluster.
@@ -140,6 +140,21 @@ Any client connected to FoundationDB can access information about its cluster fi
 
 * To get the path to the cluster file, read the key ``\xFF\xFF/cluster_file_path``.
 * To get the contents of the cluster file, read the key ``\xFF\xFF/connection_string``.
+
+.. _ipv6-support:
+
+IPv6 Support
+============
+
+FoundationDB (since v6.1) can accept network connections from clients connecting over IPv6. IPv6 address/port pair is represented as ``[IP]:PORT``, e.g. "[::1]:4800", "[abcd::dead:beef]:4500".
+
+1) The cluster file can contain mix of IPv6 and IPv6 addresses. For example::
+
+     description:ID@127.0.0.1:4500,[::1]:4500,...
+
+2) Starting ``fdbserver`` with IPv6::
+
+     $ /path/to/fdbserver -C fdb.cluster -p \[::1\]:4500
 
 .. _adding-machines-to-a-cluster:
 

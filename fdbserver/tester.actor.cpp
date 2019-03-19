@@ -23,18 +23,18 @@
 #include "fdbrpc/sim_validation.h"
 #include "fdbrpc/simulator.h"
 #include "fdbclient/ClusterInterface.h"
-#include "fdbclient/NativeAPI.h"
+#include "fdbclient/NativeAPI.actor.h"
 #include "fdbclient/SystemData.h"
-#include "fdbserver/TesterInterface.h"
-#include "fdbserver/WorkerInterface.h"
+#include "fdbserver/TesterInterface.actor.h"
+#include "fdbserver/WorkerInterface.actor.h"
 #include "fdbserver/ClusterRecruitmentInterface.h"
-#include "fdbserver/workloads/workloads.h"
+#include "fdbserver/workloads/workloads.actor.h"
 #include "fdbserver/Status.h"
 #include "fdbserver/QuietDatabase.h"
 #include "fdbclient/MonitorLeader.h"
 #include "fdbclient/FailureMonitorClient.h"
 #include "fdbserver/CoordinationInterface.h"
-#include "fdbclient/ManagementAPI.h"
+#include "fdbclient/ManagementAPI.actor.h"
 #include "flow/actorcompiler.h"  // This must be the last #include.
 
 using namespace std;
@@ -105,10 +105,11 @@ Key KVWorkload::keyForIndex( uint64_t index, bool absent ) {
 
 	int idx = 0;
 	if( nodePrefix > 0 ) {
+		ASSERT(keyBytes >= 32);
 		emplaceIndex( data, 0, nodePrefix );
 		idx += 16;
 	}
-
+	ASSERT(keyBytes >= 16);
 	double d = double(index) / nodeCount;
 	emplaceIndex( data, idx, *(int64_t*)&d );
 
@@ -149,8 +150,10 @@ int getOption( VectorRef<KeyValueRef> options, Key key, int defaultValue) {
 			if( sscanf(options[i].value.toString().c_str(), "%d", &r) ) {
 				options[i].value = LiteralStringRef("");
 				return r;
-			} else
+			} else {
+				TraceEvent(SevError, "InvalidTestOption").detail("OptionName", printable(key));
 				throw test_specification_invalid();
+			}
 		}
 
 	return defaultValue;
@@ -163,8 +166,10 @@ uint64_t getOption( VectorRef<KeyValueRef> options, Key key, uint64_t defaultVal
 			if( sscanf(options[i].value.toString().c_str(), "%lld", &r) ) {
 				options[i].value = LiteralStringRef("");
 				return r;
-			} else
+			} else {
+				TraceEvent(SevError, "InvalidTestOption").detail("OptionName", printable(key));
 				throw test_specification_invalid();
+			}
 		}
 
 	return defaultValue;
@@ -177,8 +182,10 @@ int64_t getOption( VectorRef<KeyValueRef> options, Key key, int64_t defaultValue
 			if( sscanf(options[i].value.toString().c_str(), "%lld", &r) ) {
 				options[i].value = LiteralStringRef("");
 				return r;
-			} else
+			} else {
+				TraceEvent(SevError, "InvalidTestOption").detail("OptionName", printable(key));
 				throw test_specification_invalid();
+			}
 		}
 
 	return defaultValue;
@@ -393,7 +400,7 @@ void sendResult( ReplyPromise<T>& reply, Optional<ErrorOr<T>> const& result ) {
 }
 
 ACTOR Future<Void> runWorkloadAsync( Database cx, WorkloadInterface workIface, TestWorkload *workload, double databasePingDelay ) {
-	state auto_ptr<TestWorkload> delw(workload);
+	state unique_ptr<TestWorkload> delw(workload);
 	state Optional<ErrorOr<Void>> setupResult;
 	state Optional<ErrorOr<Void>> startResult;
 	state Optional<ErrorOr<bool>> checkResult;
@@ -704,7 +711,7 @@ ACTOR Future<DistributedTestResults> runWorkload( Database cx, std::vector< Test
 				TraceEvent(SevError, "TestFailure")
 					.error(metricTasks[i].getError())
 					.detail("Reason", "Metrics not retrieved")
-					.detail("From", workloads[i].metrics.getEndpoint().address);
+					.detail("From", workloads[i].metrics.getEndpoint().getPrimaryAddress());
 		}
 	}
 
@@ -1088,11 +1095,11 @@ ACTOR Future<Void> runTests( Reference<AsyncVar<Optional<struct ClusterControlle
 		int minTestersExpected, StringRef startingConfiguration, LocalityData locality ) {
 	state int flags = (at == TEST_ON_SERVERS ? 0 : GetWorkersRequest::TESTER_CLASS_ONLY) | GetWorkersRequest::NON_EXCLUDED_PROCESSES_ONLY;
 	state Future<Void> testerTimeout = delay(600.0); // wait 600 sec for testers to show up
-	state vector<std::pair<WorkerInterface, ProcessClass>> workers;
+	state vector<WorkerDetails> workers;
 
 	loop {
 		choose {
-			when( vector<std::pair<WorkerInterface, ProcessClass>> w = wait( cc->get().present() ? brokenPromiseToNever( cc->get().get().getWorkers.getReply( GetWorkersRequest( flags ) ) ) : Never() ) ) { 
+			when( vector<WorkerDetails> w = wait( cc->get().present() ? brokenPromiseToNever( cc->get().get().getWorkers.getReply( GetWorkersRequest( flags ) ) ) : Never() ) ) { 
 				if (w.size() >= minTestersExpected) {
 					workers = w;
 					break; 
@@ -1109,7 +1116,7 @@ ACTOR Future<Void> runTests( Reference<AsyncVar<Optional<struct ClusterControlle
 
 	vector<TesterInterface> ts;
 	for(int i=0; i<workers.size(); i++)
-		ts.push_back(workers[i].first.testerInterface);
+		ts.push_back(workers[i].interf.testerInterface);
 
 	wait( runTests( cc, ci, ts, tests, startingConfiguration, locality) );
 	return Void();
@@ -1133,13 +1140,13 @@ ACTOR Future<Void> runTests( Reference<ClusterConnectionFile> connFile, test_typ
 		spec.timeout = 0;
 		spec.waitForQuiescenceBegin = false;
 		spec.waitForQuiescenceEnd = false;
-		std::string rateLimit = format("%d", CLIENT_KNOBS->CONSISTENCY_CHECK_RATE_LIMIT);
+		std::string rateLimitMax = format("%d", CLIENT_KNOBS->CONSISTENCY_CHECK_RATE_LIMIT_MAX);
 		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("testName"), LiteralStringRef("ConsistencyCheck")));
 		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("performQuiescentChecks"), LiteralStringRef("false")));
 		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("distributed"), LiteralStringRef("false")));
 		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("failureIsError"), LiteralStringRef("true")));
 		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("indefinite"), LiteralStringRef("true")));
-		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("rateLimit"), StringRef(rateLimit)));
+		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("rateLimitMax"), StringRef(rateLimitMax)));
 		options.push_back_deep(options.arena(), KeyValueRef(LiteralStringRef("shuffleShards"), LiteralStringRef("true")));
 		spec.options.push_back_deep(spec.options.arena(), options);
 		testSpecs.push_back(spec);

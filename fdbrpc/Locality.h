@@ -26,9 +26,9 @@
 
 struct ProcessClass {
 	// This enum is stored in restartInfo.ini for upgrade tests, so be very careful about changing the existing items!
-	enum ClassType { UnsetClass, StorageClass, TransactionClass, ResolutionClass, TesterClass, ProxyClass, MasterClass, StatelessClass, LogClass, ClusterControllerClass, LogRouterClass, InvalidClass = -1 };
+	enum ClassType { UnsetClass, StorageClass, TransactionClass, ResolutionClass, TesterClass, ProxyClass, MasterClass, StatelessClass, LogClass, ClusterControllerClass, LogRouterClass, DataDistributorClass, CoordinatorClass, RateKeeperClass, InvalidClass = -1 };
 	enum Fitness { BestFit, GoodFit, UnsetFit, OkayFit, WorstFit, ExcludeFit, NeverAssign }; //cannot be larger than 7 because of leader election mask
-	enum ClusterRole { Storage, TLog, Proxy, Master, Resolver, LogRouter, ClusterController };
+	enum ClusterRole { Storage, TLog, Proxy, Master, Resolver, LogRouter, ClusterController, DataDistributor, RateKeeper, NoRole };
 	enum ClassSource { CommandLineSource, AutoSource, DBSource, InvalidSource = -1 };
 	int16_t _class;
 	int16_t _source;
@@ -48,6 +48,9 @@ public:
 		else if (s=="log") _class = LogClass;
 		else if (s=="router") _class = LogRouterClass;
 		else if (s=="cluster_controller") _class = ClusterControllerClass;
+		else if (s=="data_distributor") _class = DataDistributorClass;
+		else if (s=="coordinator") _class = CoordinatorClass;
+		else if (s=="ratekeeper") _class = RateKeeperClass;
 		else _class = InvalidClass;
 	}
 
@@ -63,6 +66,9 @@ public:
 		else if (classStr=="log") _class = LogClass;
 		else if (classStr=="router") _class = LogRouterClass;
 		else if (classStr=="cluster_controller") _class = ClusterControllerClass;
+		else if (classStr=="data_distributor") _class = DataDistributorClass;
+		else if (classStr=="coordinator") _class = CoordinatorClass;
+		else if (classStr=="ratekeeper") _class = RateKeeperClass;
 		else _class = InvalidClass;
 
 		if (sourceStr=="command_line") _source = CommandLineSource;
@@ -93,6 +99,9 @@ public:
 			case LogClass: return "log";
 			case LogRouterClass: return "router";
 			case ClusterControllerClass: return "cluster_controller";
+			case DataDistributorClass: return "data_distributor";
+			case CoordinatorClass: return "coordinator";
+			case RateKeeperClass: return "ratekeeper";
 			default: return "invalid";
 		}
 	}
@@ -110,7 +119,7 @@ public:
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & _class & _source;
+		serializer(ar, _class, _source);
 	}
 };
 
@@ -188,10 +197,10 @@ public:
 			Standalone<StringRef> key;
 			Optional<Standalone<StringRef>> value;
 			uint64_t mapSize = (uint64_t)_data.size();
-			ar & mapSize;
+			serializer(ar, mapSize);
 			if (ar.isDeserializing) {
 				for (size_t i = 0; i < mapSize; i++) {
-					ar & key & value;
+					serializer(ar, key, value);
 					_data[key] = value;
 				}
 			}
@@ -199,24 +208,24 @@ public:
 				for (auto it = _data.begin(); it != _data.end(); it++) {
 					key = it->first;
 					value = it->second;
-					ar & key & value;
+					serializer(ar, key, value);
 				}
 			}
 		}
 		else {
 			ASSERT(ar.isDeserializing);
 			UID	zoneId, dcId, processId;
-			ar & zoneId & dcId;
+			serializer(ar, zoneId, dcId);
 			set(keyZoneId, Standalone<StringRef>(zoneId.toString()));
 			set(keyDcId, Standalone<StringRef>(dcId.toString()));
 
 			if (ar.protocolVersion() >= 0x0FDB00A340000001LL) {
-				ar & processId;
+				serializer(ar, processId);
 				set(keyProcessId, Standalone<StringRef>(processId.toString()));
 			}
 			else {
 				int _machineClass = ProcessClass::UnsetClass;
-				ar & _machineClass;
+				serializer(ar, _machineClass);
 			}
 		}
 	}
@@ -258,7 +267,7 @@ struct ProcessData {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & locality & processClass & address;
+		serializer(ar, locality, processClass, address);
 	}
 
 	struct sort_by_address {

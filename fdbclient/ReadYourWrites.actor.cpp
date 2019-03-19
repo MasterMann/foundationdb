@@ -32,12 +32,18 @@ public:
 		it.skip(allKeys.begin);
 		Arena arena;
 		while( true ) {
-			TraceEvent("RYWDump").detail("Begin", printable(it.beginKey().toStandaloneStringRef()))
-				.detail("End", printable(it.endKey().toStandaloneStringRef()))
-				.detail("Unknown", it.is_unknown_range())
-				.detail("Empty", it.is_empty_range())
-				.detail("KV", it.is_kv())
-				.detail("Key", printable(it.is_kv() ? it.kv(arena).key : StringRef()));
+			Optional<StringRef> key = StringRef();
+			if (it.is_kv()) {
+				auto kv = it.kv(arena);
+				if (kv) key = kv->key;
+			}
+			TraceEvent("RYWDump")
+			    .detail("Begin", printable(it.beginKey().toStandaloneStringRef()))
+			    .detail("End", printable(it.endKey().toStandaloneStringRef()))
+			    .detail("Unknown", it.is_unknown_range())
+			    .detail("Empty", it.is_empty_range())
+			    .detail("KV", it.is_kv())
+			    .detail("Key", printable(key.get()));
 			if( it.endKey() == allKeys.end )
 				break;
 			++it;
@@ -74,13 +80,18 @@ public:
 		it->skip(read.key);
 		state bool dependent = it->is_dependent();
 		if( it->is_kv() ) {
-			return it->kv(ryw->arena).value;
+			const KeyValueRef* result = it->kv(ryw->arena);
+			if (result != nullptr) {
+				return result->value;
+			} else {
+				return Optional<Value>();
+			}
 		} else if( it->is_empty_range() ) {
 			return Optional<Value>();
 		} else {
 			Optional<Value> res = wait( ryw->tr.get( read.key, true ) );
 			KeyRef k( ryw->arena, read.key );
-			
+
 			if( res.present() ) {
 				if( ryw->cache.insert( k, res.get() ) )
 					ryw->arena.dependsOn(res.get().arena());
@@ -96,7 +107,12 @@ public:
 			it->skip(k);
 
 			ASSERT( it->is_kv() );
-			return it->kv(ryw->arena).value;
+			const KeyValueRef* result = it->kv(ryw->arena);
+			if (result != nullptr) {
+				return result->value;
+			} else {
+				return Optional<Value>();
+			}
 		}
 	}
 
@@ -605,10 +621,14 @@ public:
 				resolveKeySelectorFromCache( begin, it, ryw->getMaxReadKey(), &readToBegin, &readThroughEnd, &actualBeginOffset );
 				resolveKeySelectorFromCache( end, itEnd, ryw->getMaxReadKey(), &readToBegin, &readThroughEnd, &actualEndOffset );
 			} else if (it.is_kv()) {
-				KeyValueRef const* start = &it.kv(ryw->arena);
+				KeyValueRef const* start = it.kv(ryw->arena);
+				if (start == nullptr) {
+					++it;
+					continue;
+				}
 				it.skipContiguous( end.isFirstGreaterOrEqual() ? end.getKey() : ryw->getMaxReadKey() ); //not technically correct since this would add end.getKey(), but that is protected above
-				
-				int maxCount = &it.kv(ryw->arena) - start + 1;
+
+				int maxCount = it.kv(ryw->arena) - start + 1;
 				int count = 0;
 				for(; count < maxCount && !limits.isReached(); count++ ) {
 					limits.decrement(start[count]);
@@ -884,10 +904,11 @@ public:
 				resolveKeySelectorFromCache( end, it, ryw->getMaxReadKey(), &readToBegin, &readThroughEnd, &actualEndOffset );
 				resolveKeySelectorFromCache( begin, itEnd, ryw->getMaxReadKey(), &readToBegin, &readThroughEnd, &actualBeginOffset );
 			} else {
-				if (it.is_kv()) {
-					KeyValueRef const* end = &it.kv(ryw->arena);
+				KeyValueRef const* end = it.is_kv() ? it.kv(ryw->arena) : nullptr;
+				if (end != nullptr) {
 					it.skipContiguousBack( begin.isFirstGreaterOrEqual() ? begin.getKey() : allKeys.begin );
-					KeyValueRef const* start = &it.kv(ryw->arena);
+					KeyValueRef const* start = it.kv(ryw->arena);
+					ASSERT(start != nullptr);
 
 					int maxCount = end - start + 1;
 					int count = 0;
@@ -945,7 +966,7 @@ public:
 					swapAndPop(&itCopy->value, i--);
 				} else {
 					itCopy->value[i]->setPresent = true;
-					itCopy->value[i]->setValue = val.cast_to<Value>();
+					itCopy->value[i]->setValue = val.castTo<Value>();
 				}
 			}
 
@@ -1025,7 +1046,7 @@ public:
 				return Void();
 			}
 			
-			ryw->writeRangeToNativeTransaction(KeyRangeRef(StringRef(), ryw->getMaxWriteKey()));
+			ryw->writeRangeToNativeTransaction(KeyRangeRef(StringRef(), allKeys.end));
 
 			auto conflictRanges = ryw->readConflicts.ranges();
 			for( auto iter = conflictRanges.begin(); iter != conflictRanges.end(); ++iter ) {
@@ -1076,7 +1097,12 @@ public:
 			return Void(); 
 		} catch( Error &e ) {
 			if ( !ryw->resetPromise.isSet() ) {
-				ryw->resetRyow();
+				if(ryw->tr.apiVersionAtLeast(610)) {
+					ryw->resetPromise.sendError(transaction_cancelled());
+				}
+				else {
+					ryw->resetRyow();
+				}
 			}
 			if( e.code() == error_code_broken_promise )
 				throw transaction_cancelled();
@@ -1097,7 +1123,7 @@ public:
 	}
 };
 
-ReadYourWritesTransaction::ReadYourWritesTransaction( Database const& cx ) : cache(&arena), writes(&arena), tr(cx), retries(0), creationTime(now()), commitStarted(false), options(tr) {}
+ReadYourWritesTransaction::ReadYourWritesTransaction( Database const& cx ) : cache(&arena), writes(&arena), tr(cx), retries(0), creationTime(now()), commitStarted(false), options(tr), deferredError(cx->deferredError) {}
 
 ACTOR Future<Void> timebomb(double totalSeconds, Promise<Void> resetPromise) {
 	if(totalSeconds == 0.0) {
@@ -1201,7 +1227,7 @@ Future< Optional<Value> > ReadYourWritesTransaction::get( const Key& key, bool s
 	if( resetPromise.isSet() )
 		return resetPromise.getFuture().getError();
 	
-	if(key >= getMaxReadKey())
+	if(key >= getMaxReadKey() && key != metadataVersionKey)
 		return key_outside_legal_range();
 
 	//There are no keys in the database with size greater than KEY_SIZE_LIMIT
@@ -1409,7 +1435,11 @@ void ReadYourWritesTransaction::writeRangeToNativeTransaction( KeyRangeRef const
 			for( int i = 0; i < op.size(); ++i) {
 				switch(op[i].type) {
 					case MutationRef::SetValue:
-						tr.set( it.beginKey().assertRef(), op[i].value.get(), false );
+						if (op[i].value.present()) {
+							tr.set( it.beginKey().assertRef(), op[i].value.get(), false );
+						} else {
+							tr.clear( it.beginKey().assertRef(), false );
+						}
 						break;
 					case MutationRef::AddValue:
 					case MutationRef::AppendIfFits:
@@ -1424,7 +1454,8 @@ void ReadYourWritesTransaction::writeRangeToNativeTransaction( KeyRangeRef const
 					case MutationRef::ByteMax:
 					case MutationRef::MinV2:
 					case MutationRef::AndV2:
-						tr.atomicOp( it.beginKey().assertRef(), op[i].value.get(), op[i].type, false );
+					case MutationRef::CompareAndClear:
+						tr.atomicOp(it.beginKey().assertRef(), op[i].value.get(), op[i].type, false);
 						break;
 					default:
 						break;
@@ -1473,8 +1504,14 @@ void ReadYourWritesTransaction::atomicOp( const KeyRef& key, const ValueRef& ope
 		throw used_during_commit();
 	}
 
-	if(key >= getMaxWriteKey())
+	if (key == metadataVersionKey) {
+		if(operationType != MutationRef::SetVersionstampedValue || operand != metadataVersionRequiredValue) {
+			throw client_invalid_operation();
+		}
+	}
+	else if(key >= getMaxWriteKey()) {
 		throw key_outside_legal_range();
+	}
 
 	if(!isValidMutationType(operationType) || !isAtomicOp((MutationRef::Type) operationType))
 		throw invalid_mutation_type();
@@ -1539,7 +1576,10 @@ void ReadYourWritesTransaction::set( const KeyRef& key, const ValueRef& value ) 
 		BinaryReader::fromStringRef<ClientWorkerInterface>(value, IncludeVersion()).reboot.send( RebootRequest(false, true) );
 		return;
 	}
-	
+	if (key == metadataVersionKey) {
+		throw client_invalid_operation();
+	}
+
 	bool addWriteConflict = !options.getAndResetWriteConflictDisabled();
 
 	if(checkUsedDuringCommit()) {
@@ -1639,7 +1679,7 @@ Future<Void> ReadYourWritesTransaction::watch(const Key& key) {
 	if( options.readYourWritesDisabled )
 		return watches_disabled();
 
-	if(key >= allKeys.end || (key >= getMaxReadKey() && tr.apiVersionAtLeast(300)))
+	if(key >= allKeys.end || (key >= getMaxReadKey() && key != metadataVersionKey && tr.apiVersionAtLeast(300)))
 		return key_outside_legal_range();
 
 	if (key.size() > (key.startsWith(systemKeys.begin) ? CLIENT_KNOBS->SYSTEM_KEY_SIZE_LIMIT : CLIENT_KNOBS->KEY_SIZE_LIMIT))
@@ -1779,7 +1819,7 @@ void ReadYourWritesTransaction::setOption( FDBTransactionOptions::Option option,
 	tr.setOption( option, value );
 }
 
-void ReadYourWritesTransaction::operator=(ReadYourWritesTransaction&& r) noexcept(true) {
+void ReadYourWritesTransaction::operator=(ReadYourWritesTransaction&& r) BOOST_NOEXCEPT {
 	cache = std::move( r.cache );
 	writes = std::move( r.writes );
 	arena = std::move( r.arena );
@@ -1800,7 +1840,7 @@ void ReadYourWritesTransaction::operator=(ReadYourWritesTransaction&& r) noexcep
 	writes.arena = &arena;
 }
 
-ReadYourWritesTransaction::ReadYourWritesTransaction(ReadYourWritesTransaction&& r) noexcept(true) :
+ReadYourWritesTransaction::ReadYourWritesTransaction(ReadYourWritesTransaction&& r) BOOST_NOEXCEPT :
 	cache( std::move(r.cache) ),
 	writes( std::move(r.writes) ), 
 	arena( std::move(r.arena) ), 

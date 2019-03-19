@@ -47,9 +47,9 @@
 #include "flow/FaultInjection.h"
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <windows.h>
-#undef max
-#undef min
+#include <winioctl.h>
 #include <io.h>
 #include <psapi.h>
 #include <stdio.h>
@@ -98,6 +98,8 @@
 #include <sys/resource.h>
 /* Needed for crash handler */
 #include <signal.h>
+/* Needed for gnu_dev_{major,minor} */
+#include <sys/sysmacros.h>
 #endif
 
 #ifdef __APPLE__
@@ -498,7 +500,7 @@ void getDiskBytes(std::string const& directory, int64_t& free, int64_t& total) {
 }
 
 #ifdef __unixish__
-const char* getInterfaceName(uint32_t _ip) {
+const char* getInterfaceName(const IPAddress& _ip) {
 	INJECT_FAULT( platform_error, "getInterfaceName" );
 	static char iname[20];
 
@@ -513,9 +515,15 @@ const char* getInterfaceName(uint32_t _ip) {
 	for (struct ifaddrs* iter = interfaces; iter; iter = iter->ifa_next) {
 		if(!iter->ifa_addr)
 			continue;
-		if (iter->ifa_addr->sa_family == AF_INET) {
+		if (iter->ifa_addr->sa_family == AF_INET && _ip.isV4()) {
 			uint32_t ip = ntohl(((struct sockaddr_in*)iter->ifa_addr)->sin_addr.s_addr);
-			if (ip == _ip) {
+			if (ip == _ip.toV4()) {
+				ifa_name = iter->ifa_name;
+				break;
+			}
+		} else if (iter->ifa_addr->sa_family == AF_INET6 && _ip.isV6()) {
+			struct sockaddr_in6* ifa_addr = (struct sockaddr_in6*)iter->ifa_addr;
+			if (memcmp(_ip.toV6().data(), &ifa_addr->sin6_addr, 16) == 0) {
 				ifa_name = iter->ifa_name;
 				break;
 			}
@@ -537,8 +545,8 @@ const char* getInterfaceName(uint32_t _ip) {
 #endif
 
 #if defined(__linux__)
-void getNetworkTraffic(uint32_t ip, uint64_t& bytesSent, uint64_t& bytesReceived,
-					   uint64_t& outSegs, uint64_t& retransSegs) {
+void getNetworkTraffic(const IPAddress& ip, uint64_t& bytesSent, uint64_t& bytesReceived, uint64_t& outSegs,
+                       uint64_t& retransSegs) {
 	INJECT_FAULT( platform_error, "getNetworkTraffic" ); // Even though this function doesn't throw errors, the equivalents for other platforms do, and since all of our simulation testing is on Linux...
 	const char* ifa_name = nullptr;
 	try {
@@ -643,7 +651,7 @@ void getDiskStatistics(std::string const& directory, uint64_t& currentIOs, uint6
 		unsigned int minorId;
 		disk_stream >> majorId;
 		disk_stream >> minorId;
-		if(majorId == (unsigned int) major(buf.st_dev) && minorId == (unsigned int) minor(buf.st_dev)) {
+		if(majorId == (unsigned int) gnu_dev_major(buf.st_dev) && minorId == (unsigned int) gnu_dev_minor(buf.st_dev)) {
 			std::string ignore;
 			uint64_t rd_ios;	/* # of reads completed */
 			//	    This is the total number of reads completed successfully.
@@ -745,8 +753,8 @@ dev_t getDeviceId(std::string path) {
 #endif
 
 #ifdef __APPLE__
-void getNetworkTraffic(uint32_t ip, uint64_t& bytesSent, uint64_t& bytesReceived,
-					   uint64_t& outSegs, uint64_t& retransSegs) {
+void getNetworkTraffic(const IPAddress& ip, uint64_t& bytesSent, uint64_t& bytesReceived, uint64_t& outSegs,
+                       uint64_t& retransSegs) {
 	INJECT_FAULT( platform_error, "getNetworkTraffic" );
 
 	const char* ifa_name = nullptr;
@@ -1094,7 +1102,7 @@ void initPdhStrings(SystemStatisticsState *state, std::string dataFolder) {
 }
 #endif
 
-SystemStatistics getSystemStatistics(std::string dataFolder, uint32_t ip, SystemStatisticsState **statState) {
+SystemStatistics getSystemStatistics(std::string dataFolder, const IPAddress* ip, SystemStatisticsState** statState) {
 	if( (*statState) == NULL )
 		(*statState) = new SystemStatisticsState();
 	SystemStatistics returnStats;
@@ -1188,7 +1196,7 @@ SystemStatistics getSystemStatistics(std::string dataFolder, uint32_t ip, System
 	uint64_t machineOutSegs = (*statState)->machineLastOutSegs;
 	uint64_t machineRetransSegs = (*statState)->machineLastRetransSegs;
 
-	getNetworkTraffic(ip, machineNowSent, machineNowReceived, machineOutSegs, machineRetransSegs);
+	getNetworkTraffic(*ip, machineNowSent, machineNowReceived, machineOutSegs, machineRetransSegs);
 	if( returnStats.initialized ) {
 		returnStats.machineMegabitsSent = ((machineNowSent - (*statState)->machineLastSent) * 8e-6);
 		returnStats.machineMegabitsReceived = ((machineNowReceived - (*statState)->machineLastReceived) * 8e-6);
@@ -1570,7 +1578,7 @@ void setAffinity(int proc) {
 		printf("Set affinity mask\n");
 	else
 		printf("Failed to set affinity mask: error %d\n", GetLastError());*/
-	SetThreadAffinityMask( GetCurrentThread(), 1UL<<proc );
+	SetThreadAffinityMask( GetCurrentThread(), 1ULL<<proc );
 #elif defined(__linux__)
 	cpu_set_t set;
 	CPU_ZERO(&set);
@@ -2062,6 +2070,19 @@ bool fileExists(std::string const& filename) {
 	return true;
 }
 
+bool directoryExists(std::string const& path) {
+#ifdef _WIN32
+	DWORD bits = ::GetFileAttributes(path.c_str());
+	return bits != INVALID_FILE_ATTRIBUTES && (bits & FILE_ATTRIBUTE_DIRECTORY);
+#else
+	DIR *d = opendir(path.c_str());
+	if(d == nullptr)
+		return false;
+	closedir(d);
+	return true;
+#endif
+}
+
 int64_t fileSize(std::string const& filename) {
 #ifdef _WIN32
 	struct _stati64 file_status;
@@ -2219,7 +2240,7 @@ std::string getDefaultPluginPath( const char* plugin_name ) {
 }; // namespace platform
 
 #ifdef ALLOC_INSTRUMENTATION
-#define TRACEALLOCATOR( size ) TraceEvent("MemSample").detail("Count", FastAllocator<size>::getMemoryUnused()/size).detail("TotalSize", FastAllocator<size>::getMemoryUnused()).detail("SampleCount", 1).detail("Hash", "FastAllocatedUnused" #size ).detail("Bt", "na")
+#define TRACEALLOCATOR( size ) TraceEvent("MemSample").detail("Count", FastAllocator<size>::getApproximateMemoryUnused()/size).detail("TotalSize", FastAllocator<size>::getApproximateMemoryUnused()).detail("SampleCount", 1).detail("Hash", "FastAllocatedUnused" #size ).detail("Bt", "na")
 #ifdef __linux__
 #include <cxxabi.h>
 #endif
@@ -2579,13 +2600,13 @@ extern volatile size_t net2backtraces_max;
 extern volatile bool net2backtraces_overflow;
 extern volatile int net2backtraces_count;
 extern volatile double net2liveness;
-extern volatile int profilingEnabled;
+extern volatile thread_local int profilingEnabled;
 extern void initProfiling();
 
 volatile thread_local bool profileThread = false;
 #endif
 
-volatile int profilingEnabled = 1;
+volatile thread_local int profilingEnabled = 1;
 
 void setProfilingEnabled(int enabled) { 
 	profilingEnabled = enabled; 

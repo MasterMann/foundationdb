@@ -245,7 +245,9 @@ struct SystemStatistics {
 
 struct SystemStatisticsState;
 
-SystemStatistics getSystemStatistics(std::string dataFolder, uint32_t ip, SystemStatisticsState **statState);
+struct IPAddress;
+
+SystemStatistics getSystemStatistics(std::string dataFolder, const IPAddress* ip, SystemStatisticsState **statState);
 
 double getProcessorTimeThread();
 
@@ -290,6 +292,9 @@ void threadYield();  // Attempt to yield to other processes or threads
 
 // Returns true iff the file exists
 bool fileExists(std::string const& filename);
+
+// Returns true iff the directory exists
+bool directoryExists(std::string const& path);
 
 // Returns size of file in bytes
 int64_t fileSize(std::string const& filename);
@@ -539,12 +544,8 @@ inline static int ctzll( uint64_t value ) {
 #define ctzll __builtin_ctzll
 #endif
 
-// MSVC not support noexcept yet
-#ifndef __GNUG__
-#ifndef VS14
-#define noexcept(enabled)
-#endif
-#endif
+#include <boost/config.hpp>
+// The formerly existing BOOST_NOEXCEPT is now BOOST_NOEXCEPT
 
 #else
 #define EXTERNC

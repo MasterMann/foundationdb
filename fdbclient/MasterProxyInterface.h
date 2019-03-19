@@ -1,3 +1,4 @@
+
 /*
  * MasterProxyInterface.h
  *
@@ -26,6 +27,8 @@
 #include "fdbclient/StorageServerInterface.h"
 #include "fdbclient/CommitTransaction.h"
 
+#include "flow/Stats.h"
+
 struct MasterProxyInterface {
 	enum { LocationAwareLoadBalance = 1 };
 	enum { AlwaysFresh = 1 };
@@ -42,15 +45,19 @@ struct MasterProxyInterface {
 	RequestStream< struct GetRawCommittedVersionRequest > getRawCommittedVersion;
 	RequestStream< struct TxnStateRequest >  txnState;
 
+	RequestStream< struct GetHealthMetricsRequest > getHealthMetrics;
+
 	UID id() const { return commit.getEndpoint().token; }
 	std::string toString() const { return id().shortString(); }
 	bool operator == (MasterProxyInterface const& r) const { return id() == r.id(); }
 	bool operator != (MasterProxyInterface const& r) const { return id() != r.id(); }
-	NetworkAddress address() const { return commit.getEndpoint().address; }
+	NetworkAddress address() const { return commit.getEndpoint().getPrimaryAddress(); }
 
 	template <class Archive>
 	void serialize(Archive& ar) {
-		ar & locality & commit & getConsistentReadVersion & getKeyServersLocations & waitFailure & getStorageServerRejoinInfo & getRawCommittedVersion & txnState;
+		serializer(ar, locality, commit, getConsistentReadVersion, getKeyServersLocations,
+				   waitFailure, getStorageServerRejoinInfo, getRawCommittedVersion,
+				   txnState, getHealthMetrics);
 	}
 
 	void initEndpoints() {
@@ -64,24 +71,25 @@ struct MasterProxyInterface {
 struct CommitID {
 	Version version; 			// returns invalidVersion if transaction conflicts
 	uint16_t txnBatchId;
+	Optional<Value> metadataVersion;
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & version & txnBatchId;
+		serializer(ar, version, txnBatchId, metadataVersion);
 	}
 
 	CommitID() : version(invalidVersion), txnBatchId(0) {}
-	CommitID( Version version, uint16_t txnBatchId ) : version(version), txnBatchId(txnBatchId) {}
+	CommitID( Version version, uint16_t txnBatchId, const Optional<Value>& metadataVersion ) : version(version), txnBatchId(txnBatchId), metadataVersion(metadataVersion) {}
 };
 
-struct CommitTransactionRequest {
+struct CommitTransactionRequest : TimedRequest {
 	enum { 
 		FLAG_IS_LOCK_AWARE = 0x1,
 		FLAG_FIRST_IN_BATCH = 0x2
 	};
 
-	bool isLockAware() const { return flags & FLAG_IS_LOCK_AWARE; }
-	bool firstInBatch() const { return flags & FLAG_FIRST_IN_BATCH; }
+	bool isLockAware() const { return (flags & FLAG_IS_LOCK_AWARE) != 0; }
+	bool firstInBatch() const { return (flags & FLAG_FIRST_IN_BATCH) != 0; }
 	
 	Arena arena;
 	CommitTransactionRef transaction;
@@ -93,7 +101,7 @@ struct CommitTransactionRequest {
 
 	template <class Ar> 
 	void serialize(Ar& ar) { 
-		ar & transaction & reply & arena & flags & debugID;
+		serializer(ar, transaction, reply, arena, flags, debugID);
 	}
 };
 
@@ -113,14 +121,15 @@ static inline int getBytes( CommitTransactionRequest const& r ) {
 struct GetReadVersionReply {
 	Version version;
 	bool locked;
+	Optional<Value> metadataVersion;
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & version & locked;
+		serializer(ar, version, locked, metadataVersion);
 	}
 };
 
-struct GetReadVersionRequest {
+struct GetReadVersionRequest : TimedRequest {
 	enum { 
 		PRIORITY_SYSTEM_IMMEDIATE = 15 << 24,  // Highest possible priority, always executed even if writes are otherwise blocked
 		PRIORITY_DEFAULT = 8 << 24,
@@ -144,7 +153,7 @@ struct GetReadVersionRequest {
 
 	template <class Ar> 
 	void serialize(Ar& ar) { 
-		ar & transactionCount & flags & debugID & reply;
+		serializer(ar, transactionCount, flags, debugID, reply);
 	}
 };
 
@@ -154,7 +163,7 @@ struct GetKeyServerLocationsReply {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & results & arena;
+		serializer(ar, results, arena);
 	}
 };
 
@@ -171,7 +180,7 @@ struct GetKeyServerLocationsRequest {
 	
 	template <class Ar> 
 	void serialize(Ar& ar) { 
-		ar & begin & end & limit & reverse & reply & arena;
+		serializer(ar, begin, end, limit, reverse, reply, arena);
 	}
 };
 
@@ -183,7 +192,7 @@ struct GetRawCommittedVersionRequest {
 
 	template <class Ar>
 	void serialize( Ar& ar ) {
-		ar & debugID & reply;
+		serializer(ar, debugID, reply);
 	}
 };
 
@@ -196,7 +205,7 @@ struct GetStorageServerRejoinInfoReply {
 
 	template <class Ar>
 	void serialize(Ar& ar) {
-		ar & version & tag & newTag & newLocality & history;
+		serializer(ar, version, tag, newTag, newLocality, history);
 	}
 };
 
@@ -210,7 +219,7 @@ struct GetStorageServerRejoinInfoRequest {
 
 	template <class Ar>
 	void serialize( Ar& ar ) {
-		ar & id & dcId & reply;
+		serializer(ar, id, dcId, reply);
 	}
 };
 
@@ -223,7 +232,50 @@ struct TxnStateRequest {
 
 	template <class Ar> 
 	void serialize(Ar& ar) { 
-		ar & data & sequence & last & reply & arena;
+		serializer(ar, data, sequence, last, reply, arena);
+	}
+};
+
+struct GetHealthMetricsRequest
+{
+	ReplyPromise<struct GetHealthMetricsReply> reply;
+	bool detailed;
+
+	explicit GetHealthMetricsRequest(bool detailed = false) : detailed(detailed) {}
+
+	template <class Ar>
+	void serialize(Ar& ar)
+	{
+		serializer(ar, reply, detailed);
+	}
+};
+
+struct GetHealthMetricsReply
+{
+	Standalone<StringRef> serialized;
+	HealthMetrics healthMetrics;
+
+	explicit GetHealthMetricsReply(const HealthMetrics& healthMetrics = HealthMetrics()) :
+		healthMetrics(healthMetrics)
+	{
+		update(healthMetrics, true, true);
+	}
+
+	void update(const HealthMetrics& healthMetrics, bool detailedInput, bool detailedOutput)
+	{
+		this->healthMetrics.update(healthMetrics, detailedInput, detailedOutput);
+		BinaryWriter bw(IncludeVersion());
+		bw << this->healthMetrics;
+		serialized = Standalone<StringRef>(bw.toStringRef());
+	}
+
+	template <class Ar>
+	void serialize(Ar& ar) {
+		serializer(ar, serialized);
+		if (ar.isDeserializing) {
+			BinaryReader br(serialized, IncludeVersion());
+			br >> healthMetrics;
+		}
 	}
 };
 

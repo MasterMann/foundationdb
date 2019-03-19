@@ -19,6 +19,8 @@
  */
 
 #include "fdbclient/BackupContainer.h"
+#include "fdbclient/BackupAgent.actor.h"
+#include "fdbclient/JsonBuilder.h"
 #include "flow/Trace.h"
 #include "flow/UnitTest.h"
 #include "flow/Hash3.h"
@@ -32,6 +34,7 @@
 #include "fdbclient/RunTransaction.actor.h"
 #include <algorithm>
 #include <time.h>
+#include "flow/actorcompiler.h" // has to be last include
 
 namespace IBackupFile_impl {
 
@@ -47,13 +50,24 @@ Future<Void> IBackupFile::appendStringRefWithLen(Standalone<StringRef> s) {
 	return IBackupFile_impl::appendStringRefWithLen(Reference<IBackupFile>::addRef(this), s);
 }
 
-std::string formatTime(int64_t t) {
-	time_t curTime = (time_t)t;
-	char buffer[128];
-	struct tm timeinfo;
-	getLocalTime(&curTime, &timeinfo);
-	strftime(buffer, 128, "%Y-%m-%d %H:%M:%S", &timeinfo);
-	return buffer;
+std::string IBackupContainer::ExpireProgress::toString() const {
+	std::string s = step + "...";
+	if(total > 0) {
+		s += format("%d/%d (%.2f%%)", done, total, double(done) / total * 100);
+	}
+	return s;
+}
+
+void BackupFileList::toStream(FILE *fout) const {
+	for(const RangeFile &f : ranges) {
+		fprintf(fout, "range %lld %s\n", f.fileSize, f.fileName.c_str());
+	}
+	for(const LogFile &f : logs) {
+		fprintf(fout, "log %lld %s\n", f.fileSize, f.fileName.c_str());
+	}
+	for(const KeyspaceSnapshotFile &f : snapshots) {
+		fprintf(fout, "snapshotManifest %lld %s\n", f.totalSize, f.fileName.c_str());
+	}
 }
 
 Future<Void> fetchTimes(Reference<ReadYourWritesTransaction> tr,  std::map<Version, int64_t> *pVersionTimeMap) {
@@ -106,9 +120,13 @@ std::string BackupDescription::toString() const {
 		if(!versionTimeMap.empty()) {
 			auto i = versionTimeMap.find(v);
 			if(i != versionTimeMap.end())
-				s = format("%lld (%s)", v, formatTime(i->second).c_str());
+				s = format("%lld (%s)", v, BackupAgentBase::formatTime(i->second).c_str());
 			else
 				s = format("%lld (unknown)", v);
+		}
+		else if(maxLogEnd.present()) {
+			double days = double(maxLogEnd.get() - v) / (CLIENT_KNOBS->CORE_VERSIONSPERSECOND * 24 * 60 * 60);
+			s = format("%lld (maxLogEnd %s%.2f days)", v, days < 0 ? "+" : "-", days);
 		}
 		else {
 			s = format("%lld", v);
@@ -117,12 +135,16 @@ std::string BackupDescription::toString() const {
 	};
 
 	for(const KeyspaceSnapshotFile &m : snapshots) {
-		info.append(format("Snapshot:  startVersion=%s  endVersion=%s  totalBytes=%lld  restorable=%s\n",
-			formatVersion(m.beginVersion).c_str(), formatVersion(m.endVersion).c_str(), m.totalSize, m.restorable.orDefault(false) ? "true" : "false"));
+		info.append(format("Snapshot:  startVersion=%s  endVersion=%s  totalBytes=%lld  restorable=%s  expiredPct=%.2f\n",
+			formatVersion(m.beginVersion).c_str(), formatVersion(m.endVersion).c_str(), m.totalSize, m.restorable.orDefault(false) ? "true" : "false", m.expiredPct(expiredEndVersion)));
 	}
 
 	info.append(format("SnapshotBytes: %lld\n", snapshotBytes));
 
+	if(expiredEndVersion.present())
+		info.append(format("ExpiredEndVersion:       %s\n", formatVersion(expiredEndVersion.get()).c_str()));
+	if(unreliableEndVersion.present())
+		info.append(format("UnreliableEndVersion:    %s\n", formatVersion(unreliableEndVersion.get()).c_str()));
 	if(minLogBegin.present())
 		info.append(format("MinLogBeginVersion:      %s\n", formatVersion(minLogBegin.get()).c_str()));
 	if(contiguousLogEnd.present())
@@ -138,6 +160,65 @@ std::string BackupDescription::toString() const {
 		info.append("ExtendedDetail: ").append(extendedDetail);
 
 	return info;
+}
+
+std::string BackupDescription::toJSON() const {
+	JsonBuilderObject doc;
+
+	doc.setKey("SchemaVersion", "1.0.0");
+	doc.setKey("URL", url.c_str());
+	doc.setKey("Restorable", maxRestorableVersion.present());
+
+	auto formatVersion = [&](Version v) {
+		JsonBuilderObject doc;
+		doc.setKey("Version", v);
+		if(!versionTimeMap.empty()) {
+			auto i = versionTimeMap.find(v);
+			if(i != versionTimeMap.end()) {
+				doc.setKey("Timestamp", BackupAgentBase::formatTime(i->second));
+				doc.setKey("EpochSeconds", i->second);
+			}
+		}
+		else if(maxLogEnd.present()) {
+			double days = double(v - maxLogEnd.get()) / (CLIENT_KNOBS->CORE_VERSIONSPERSECOND * 24 * 60 * 60);
+			doc.setKey("RelativeDays", days);
+		}
+		return doc;
+	};
+
+	JsonBuilderArray snapshotsArray;
+	for(const KeyspaceSnapshotFile &m : snapshots) {
+		JsonBuilderObject snapshotDoc;
+		snapshotDoc.setKey("Start", formatVersion(m.beginVersion));
+		snapshotDoc.setKey("End", formatVersion(m.endVersion));
+		snapshotDoc.setKey("Restorable", m.restorable.orDefault(false));
+		snapshotDoc.setKey("TotalBytes", m.totalSize);
+		snapshotDoc.setKey("PercentageExpired", m.expiredPct(expiredEndVersion));
+		snapshotsArray.push_back(snapshotDoc);
+	}
+	doc.setKey("Snapshots", snapshotsArray);
+
+	doc.setKey("TotalSnapshotBytes", snapshotBytes);
+
+	if(expiredEndVersion.present())
+		doc.setKey("ExpiredEnd", formatVersion(expiredEndVersion.get()));
+	if(unreliableEndVersion.present())
+		doc.setKey("UnreliableEnd", formatVersion(unreliableEndVersion.get()));
+	if(minLogBegin.present())
+		doc.setKey("MinLogBegin", formatVersion(minLogBegin.get()));
+	if(contiguousLogEnd.present())
+		doc.setKey("ContiguousLogEnd", formatVersion(contiguousLogEnd.get()));
+	if(maxLogEnd.present())
+		doc.setKey("MaxLogEnd", formatVersion(maxLogEnd.get()));
+	if(minRestorableVersion.present())
+		doc.setKey("MinRestorablePoint", formatVersion(minRestorableVersion.get()));
+	if(maxRestorableVersion.present())
+		doc.setKey("MaxRestorablePoint", formatVersion(maxRestorableVersion.get()));
+
+	if(!extendedDetail.empty())
+		doc.setKey("ExtendedDetail", extendedDetail);
+
+	return doc.getJson();
 }
 
 /* BackupContainerFileSystem implements a backup container which stores files in a nested folder structure.
@@ -184,6 +265,7 @@ public:
 
 	// Create the container
 	virtual Future<Void> create() = 0;
+	virtual Future<bool> exists() = 0;
 
 	// Get a list of fileNames and their sizes in the container under the given path
 	// Although not required, an implementation can avoid traversing unwanted subfolders
@@ -316,7 +398,7 @@ public:
 		state Reference<IAsyncFile> f = wait(bc->readFile(snapshot.fileName));
 		int64_t size = wait(f->size());
 		state Standalone<StringRef> buf = makeString(size);
-		int _ = wait(f->read(mutateString(buf), buf.size(), 0));
+		wait(success(f->read(mutateString(buf), buf.size(), 0)));
 		json_spirit::mValue json;
 		json_spirit::read_string(buf.toString(), json);
 		JSONDoc doc(json);
@@ -332,14 +414,34 @@ public:
 			throw restore_corrupted_data();
 
 		std::vector<RangeFile> results;
+		int missing = 0;
+
 		for(auto const &fileValue : filesArray.get_array()) {
 			if(fileValue.type() != json_spirit::str_type)
 				throw restore_corrupted_data();
-			auto i = rangeIndex.find(fileValue.get_str());
-			if(i == rangeIndex.end())
-				throw restore_corrupted_data();
 
-			results.push_back(i->second);
+			// If the file is not in the index then log the error but don't throw yet, keep checking the whole list.
+			auto i = rangeIndex.find(fileValue.get_str());
+			if(i == rangeIndex.end()) {
+				TraceEvent(SevError, "FileRestoreMissingRangeFile")
+					.detail("URL", bc->getURL())
+					.detail("File", fileValue.get_str());
+
+				++missing;
+			}
+
+			// No point in using more memory once data is missing since an error will be thrown instead.
+			if(missing == 0) {
+				results.push_back(i->second);
+			}
+		}
+
+		if(missing > 0) {
+			TraceEvent(SevError, "FileRestoreMissingRangeFileSummary")
+				.detail("URL", bc->getURL())
+				.detail("Count", missing);
+
+			throw restore_missing_data();
 		}
 
 		return results;
@@ -396,8 +498,7 @@ public:
 		return writeKeyspaceSnapshotFile_impl(Reference<BackupContainerFileSystem>::addRef(this), fileNames, totalBytes);
 	};
 
-	// List log files which contain data at any version >= beginVersion and <= targetVersion
-	// Lists files in sorted order by begin version. Does not check that results are non overlapping or contiguous.
+	// List log files, unsorted, which contain data at any version >= beginVersion and <= targetVersion
 	Future<std::vector<LogFile>> listLogFiles(Version beginVersion = 0, Version targetVersion = std::numeric_limits<Version>::max()) {
 		// The first relevant log file could have a begin version less than beginVersion based on the knobs which determine log file range size,
 		// so start at an earlier version adjusted by how many versions a file could contain.
@@ -423,12 +524,11 @@ public:
 				if(pathToLogFile(lf, f.first, f.second) && lf.endVersion > beginVersion && lf.beginVersion <= targetVersion)
 					results.push_back(lf);
 			}
-			std::sort(results.begin(), results.end());
 			return results;
 		});
 	}
 
-	// List range files which contain data at or between beginVersion and endVersion
+	// List range files, unsorted, which contain data at or between beginVersion and endVersion
 	// NOTE: This reads the range file folder schema from FDB 6.0.15 and earlier and is provided for backward compatibility
 	Future<std::vector<RangeFile>> old_listRangeFiles(Version beginVersion, Version endVersion) {
 		// Get the cleaned (without slashes) first and last folders that could contain relevant results.
@@ -454,7 +554,7 @@ public:
 		});
 	}
 
-	// List range files, sorted in version order, which contain data at or between beginVersion and endVersion
+	// List range files, unsorted, which contain data at or between beginVersion and endVersion
 	// Note: The contents of each top level snapshot.N folder do not necessarily constitute a valid snapshot
 	// and therefore listing files is not how RestoreSets are obtained.
 	// Note: Snapshots partially written using FDB versions prior to 6.0.16 will have some range files stored
@@ -483,18 +583,17 @@ public:
 			std::vector<RangeFile> results = std::move(newFiles.get());
 			std::vector<RangeFile> oldResults = std::move(oldFiles.get());
 			results.insert(results.end(), std::make_move_iterator(oldResults.begin()), std::make_move_iterator(oldResults.end()));
-			std::sort(results.begin(), results.end());
 			return results;
 		});
 	}
 
-	// List snapshots which have been fully written, in sorted beginVersion order.
-	Future<std::vector<KeyspaceSnapshotFile>> listKeyspaceSnapshots() {
+	// List snapshots which have been fully written, in sorted beginVersion order, which start before end and finish on or after begin
+	Future<std::vector<KeyspaceSnapshotFile>> listKeyspaceSnapshots(Version begin = 0, Version end = std::numeric_limits<Version>::max()) {
 		return map(listFiles("snapshots/"), [=](const FilesAndSizesT &files) {
 			std::vector<KeyspaceSnapshotFile> results;
 			KeyspaceSnapshotFile sf;
 			for(auto &f : files) {
-				if(pathToKeyspaceSnapshotFile(sf, f.first))
+				if(pathToKeyspaceSnapshotFile(sf, f.first) && sf.beginVersion < end && sf.endVersion >= begin)
 					results.push_back(sf);
 			}
 			std::sort(results.begin(), results.end());
@@ -502,50 +601,144 @@ public:
 		});
 	}
 
-	ACTOR static Future<FullBackupListing> dumpFileList_impl(Reference<BackupContainerFileSystem> bc) {
-		state Future<std::vector<RangeFile>> fRanges = bc->listRangeFiles(0, std::numeric_limits<Version>::max());
-		state Future<std::vector<KeyspaceSnapshotFile>> fSnapshots = bc->listKeyspaceSnapshots();
-		state Future<std::vector<LogFile>> fLogs = bc->listLogFiles(0, std::numeric_limits<Version>::max());
+	ACTOR static Future<BackupFileList> dumpFileList_impl(Reference<BackupContainerFileSystem> bc, Version begin, Version end) {
+		state Future<std::vector<RangeFile>> fRanges = bc->listRangeFiles(begin, end);
+		state Future<std::vector<KeyspaceSnapshotFile>> fSnapshots = bc->listKeyspaceSnapshots(begin, end);
+		state Future<std::vector<LogFile>> fLogs = bc->listLogFiles(begin, end);
+
 		wait(success(fRanges) && success(fSnapshots) && success(fLogs));
-		return FullBackupListing({fRanges.get(), fLogs.get(), fSnapshots.get()});
+
+		return BackupFileList({fRanges.get(), fLogs.get(), fSnapshots.get()});
 	}
 
-	Future<FullBackupListing> dumpFileList() {
-		return dumpFileList_impl(Reference<BackupContainerFileSystem>::addRef(this));
+	Future<BackupFileList> dumpFileList(Version begin, Version end) {
+		return dumpFileList_impl(Reference<BackupContainerFileSystem>::addRef(this), begin, end);
 	}
 
-	ACTOR static Future<BackupDescription> describeBackup_impl(Reference<BackupContainerFileSystem> bc, bool deepScan) {
+	static Version resolveRelativeVersion(Optional<Version> max, Version v, const char *name, Error e) {
+		if(v == invalidVersion) {
+			TraceEvent(SevError, "BackupExpireInvalidVersion").detail(name, v);
+			throw e;
+		}
+		if(v < 0) {
+			if(!max.present()) {
+				TraceEvent(SevError, "BackupExpireCannotResolveRelativeVersion").detail(name, v);
+				throw e;
+			}
+			v += max.get();
+		}
+		return v;
+	}
+
+	ACTOR static Future<BackupDescription> describeBackup_impl(Reference<BackupContainerFileSystem> bc, bool deepScan, Version logStartVersionOverride) {
 		state BackupDescription desc;
 		desc.url = bc->getURL();
 
-		// This is the range of logs we'll have to list to determine log continuity
-		state Version scanBegin = 0;
-		state Version scanEnd = std::numeric_limits<Version>::max();
+		TraceEvent("BackupContainerDescribe1")
+			.detail("URL", bc->getURL())
+			.detail("LogStartVersionOverride", logStartVersionOverride);
 
-		// Get range for which we know there are logs, if available
-		state Optional<Version> begin;
-		state Optional<Version> end;
-
-		if(!deepScan) {
-			wait(store(bc->logBeginVersion().get(), begin) && store(bc->logEndVersion().get(), end));
+		bool e = wait(bc->exists());
+		if(!e) {
+			TraceEvent(SevWarnAlways, "BackupContainerDoesNotExist").detail("URL", bc->getURL());
+			throw backup_does_not_exist();
 		}
 
+		// If logStartVersion is relative, then first do a recursive call without it to find the max log version
+		// from which to resolve the relative version.
+		// This could be handled more efficiently without recursion but it's tricky, this will do for now.
+		if(logStartVersionOverride != invalidVersion && logStartVersionOverride < 0) {
+			BackupDescription tmp = wait(bc->describeBackup(false, invalidVersion));
+			logStartVersionOverride = resolveRelativeVersion(tmp.maxLogEnd, logStartVersionOverride, "LogStartVersionOverride", invalid_option_value());
+		}
+
+		// Get metadata versions
+		state Optional<Version> metaLogBegin;
+		state Optional<Version> metaLogEnd;
+		state Optional<Version> metaExpiredEnd;
+		state Optional<Version> metaUnreliableEnd;
+
+		std::vector<Future<Void>> metaReads;
+		metaReads.push_back(store(metaExpiredEnd, bc->expiredEndVersion().get()));
+		metaReads.push_back(store(metaUnreliableEnd, bc->unreliableEndVersion().get()));
+
+		// Only read log begin/end versions if not doing a deep scan, otherwise scan files and recalculate them.
+		if(!deepScan) {
+			metaReads.push_back(store(metaLogBegin, bc->logBeginVersion().get()));
+			metaReads.push_back(store(metaLogEnd, bc->logEndVersion().get()));
+		}
+
+		wait(waitForAll(metaReads));
+
+		TraceEvent("BackupContainerDescribe2")
+			.detail("URL", bc->getURL())
+			.detail("LogStartVersionOverride", logStartVersionOverride)
+			.detail("ExpiredEndVersion", metaExpiredEnd.orDefault(invalidVersion))
+			.detail("UnreliableEndVersion", metaUnreliableEnd.orDefault(invalidVersion))
+			.detail("LogBeginVersion", metaLogBegin.orDefault(invalidVersion))
+			.detail("LogEndVersion", metaLogEnd.orDefault(invalidVersion));
+
+		// If the logStartVersionOverride is positive (not relative) then ensure that unreliableEndVersion is equal or greater
+		if(logStartVersionOverride != invalidVersion && metaUnreliableEnd.orDefault(invalidVersion) < logStartVersionOverride) {
+			metaUnreliableEnd = logStartVersionOverride;
+		}
+
+		// Don't use metaLogBegin or metaLogEnd if any of the following are true, the safest
+		// thing to do is rescan to verify log continuity and get exact begin/end versions
+		//   - either are missing
+		//   - metaLogEnd <= metaLogBegin       (invalid range)
+		//   - metaLogEnd < metaExpiredEnd      (log continuity exists in missing data range) 
+		//   - metaLogEnd < metaUnreliableEnd   (log continuity exists in incomplete data range)
+		if(!metaLogBegin.present() || !metaLogEnd.present()
+			 || metaLogEnd.get() <= metaLogBegin.get()
+			 || metaLogEnd.get() < metaExpiredEnd.orDefault(invalidVersion)
+			 || metaLogEnd.get() < metaUnreliableEnd.orDefault(invalidVersion)
+		) {
+			TraceEvent(SevWarnAlways, "BackupContainerMetadataInvalid")
+				.detail("URL", bc->getURL())
+				.detail("ExpiredEndVersion", metaExpiredEnd.orDefault(invalidVersion))
+				.detail("UnreliableEndVersion", metaUnreliableEnd.orDefault(invalidVersion))
+				.detail("LogBeginVersion", metaLogBegin.orDefault(invalidVersion))
+				.detail("LogEndVersion", metaLogEnd.orDefault(invalidVersion));
+
+			metaLogBegin = Optional<Version>();
+			metaLogEnd = Optional<Version>();
+		}
+
+		// If the unreliable end version is not set or is < expiredEndVersion then increase it to expiredEndVersion.
+		// Describe does not update unreliableEnd in the backup metadata for safety reasons as there is no 
+		// compare-and-set operation to atomically change it and an expire process could be advancing it simultaneously.
+		if(!metaUnreliableEnd.present() || metaUnreliableEnd.get() < metaExpiredEnd.orDefault(0))
+			metaUnreliableEnd = metaExpiredEnd;
+
+		desc.unreliableEndVersion = metaUnreliableEnd;
+		desc.expiredEndVersion = metaExpiredEnd;
+
+		// Start scanning at the end of the unreliable version range, which is the version before which data is likely
+		// missing because an expire process has operated on that range.
+		state Version scanBegin = desc.unreliableEndVersion.orDefault(0);
+		state Version scanEnd = std::numeric_limits<Version>::max();
+
 		// Use the known log range if present
-		if(begin.present() && end.present()) {
-			// Logs are assumed to be contiguious between begin and max(begin, end), so initalize desc accordingly
-			// The use of max() is to allow for a stale end version that has been exceeded by begin version
-			desc.minLogBegin = begin.get();
-			desc.maxLogEnd = std::max(begin.get(), end.get());
+		// Logs are assumed to be contiguious between metaLogBegin and metaLogEnd, so initalize desc accordingly
+		if(metaLogBegin.present() && metaLogEnd.present()) {
+			// minLogBegin is the greater of the log begin metadata OR the unreliable end version since we can't count
+			// on log file presence before that version.
+			desc.minLogBegin = std::max(metaLogBegin.get(), desc.unreliableEndVersion.orDefault(0));
+
+			// Set the maximum known end version of a log file, so far, which is also the assumed contiguous log file end version
+			desc.maxLogEnd = metaLogEnd.get();
 			desc.contiguousLogEnd = desc.maxLogEnd;
 
-			// Begin file scan at the contiguous log end version
+			// Advance scanBegin to the contiguous log end version
 			scanBegin = desc.contiguousLogEnd.get();
 		}
 
-		std::vector<KeyspaceSnapshotFile> snapshots = wait(bc->listKeyspaceSnapshots());
-		desc.snapshots = snapshots;
+		state std::vector<LogFile> logs;
+		wait(store(logs, bc->listLogFiles(scanBegin, scanEnd)) && store(desc.snapshots, bc->listKeyspaceSnapshots()));
 
-		std::vector<LogFile> logs = wait(bc->listLogFiles(scanBegin, scanEnd));
+		// List logs in version order so log continuity can be analyzed
+		std::sort(logs.begin(), logs.end());
 
 		if(!logs.empty()) {
 			desc.maxLogEnd = logs.rbegin()->endVersion;
@@ -570,20 +763,32 @@ public:
 			}
 		}
 
-		// Try to update the saved log versions if they are not set and we have values for them,
-		// but ignore errors in the update attempt in case the container is not writeable
-		// Also update logEndVersion if it has a value but it is less than contiguousLogEnd
-		try {
-			state Future<Void> updates = Void();
-			if(desc.minLogBegin.present() && !begin.present())
-				updates = updates && bc->logBeginVersion().set(desc.minLogBegin.get());
-			if(desc.contiguousLogEnd.present() && (!end.present() || end.get() < desc.contiguousLogEnd.get()) )
-				updates = updates && bc->logEndVersion().set(desc.contiguousLogEnd.get());
-			wait(updates);
-		} catch(Error &e) {
-			if(e.code() == error_code_actor_cancelled)
-				throw;
-			TraceEvent(SevWarn, "BackupContainerSafeVersionUpdateFailure").detail("URL", bc->getURL());
+		// Only update stored contiguous log begin and end versions if we did NOT use a log start override.
+		// Otherwise, a series of describe operations can result in a version range which is actually missing data.
+		if(logStartVersionOverride == invalidVersion) {
+			// If the log metadata begin/end versions are missing (or treated as missing due to invalidity) or
+			// differ from the newly calculated values for minLogBegin and contiguousLogEnd, respectively,
+			// then attempt to update the metadata in the backup container but ignore errors in case the 
+			// container is not writeable.
+			try {
+				state Future<Void> updates = Void();
+
+				if(desc.minLogBegin.present() && metaLogBegin != desc.minLogBegin) {
+					updates = updates && bc->logBeginVersion().set(desc.minLogBegin.get());
+				}
+
+				if(desc.contiguousLogEnd.present() && metaLogEnd != desc.contiguousLogEnd) {
+					updates = updates && bc->logEndVersion().set(desc.contiguousLogEnd.get());
+				}
+
+				wait(updates);
+			} catch(Error &e) {
+				if(e.code() == error_code_actor_cancelled)
+					throw;
+				TraceEvent(SevWarn, "BackupContainerMetadataUpdateFailure")
+					.error(e)
+					.detail("URL", bc->getURL());
+			}
 		}
 
 		for(auto &s : desc.snapshots) {
@@ -623,18 +828,37 @@ public:
 	}
 
 	// Uses the virtual methods to describe the backup contents
-	Future<BackupDescription> describeBackup(bool deepScan = false) {
-		return describeBackup_impl(Reference<BackupContainerFileSystem>::addRef(this), deepScan);
+	Future<BackupDescription> describeBackup(bool deepScan, Version logStartVersionOverride) {
+		return describeBackup_impl(Reference<BackupContainerFileSystem>::addRef(this), deepScan, logStartVersionOverride);
 	}
 
-	ACTOR static Future<Void> expireData_impl(Reference<BackupContainerFileSystem> bc, Version expireEndVersion, bool force, Version restorableBeginVersion) {
+	ACTOR static Future<Void> expireData_impl(Reference<BackupContainerFileSystem> bc, Version expireEndVersion, bool force, ExpireProgress *progress, Version restorableBeginVersion) {
+		if(progress != nullptr) {
+			progress->step = "Describing backup";
+			progress->total = 0;
+		}
+
+		TraceEvent("BackupContainerFileSystemExpire1")
+			.detail("URL", bc->getURL())
+			.detail("ExpireEndVersion", expireEndVersion)
+			.detail("RestorableBeginVersion", restorableBeginVersion);
+
+		// Get the backup description.
+		state BackupDescription desc = wait(bc->describeBackup(false, expireEndVersion));
+
+		// Resolve relative versions using max log version
+		expireEndVersion =       resolveRelativeVersion(desc.maxLogEnd, expireEndVersion,       "ExpireEndVersion",       invalid_option_value());
+		restorableBeginVersion = resolveRelativeVersion(desc.maxLogEnd, restorableBeginVersion, "RestorableBeginVersion", invalid_option_value());
+
+		// It would be impossible to have restorability to any version < expireEndVersion after expiring to that version
 		if(restorableBeginVersion < expireEndVersion)
 			throw backup_cannot_expire();
 
-		state Version scanBegin = 0;
-
-		// Get the backup description.
-		state BackupDescription desc = wait(bc->describeBackup());
+		// If the expire request is to a version at or before the previous version to which data was already deleted
+		// then do nothing and just return
+		if(expireEndVersion <= desc.expiredEndVersion.orDefault(invalidVersion)) {
+			return Void();
+		}
 
 		// Assume force is needed, then try to prove otherwise.
 		// Force is required if there is not a restorable snapshot which both
@@ -648,47 +872,50 @@ public:
 			}
 		}
 
-		// Get metadata
-		state Optional<Version> expiredEnd;
-		state Optional<Version> logBegin;
-		state Optional<Version> logEnd;
-		wait(store(bc->expiredEndVersion().get(), expiredEnd) && store(bc->logBeginVersion().get(), logBegin) && store(bc->logEndVersion().get(), logEnd));
+		// If force is needed but not passed then refuse to expire anything.
+		// Note that it is possible for there to be no actual files in the backup prior to expireEndVersion,
+		// if they were externally deleted or an expire operation deleted them but was terminated before
+		// updating expireEndVersion
+		if(forceNeeded && !force)
+			throw backup_cannot_expire();
 
-		// Update scan range if expiredEnd is present
-		if(expiredEnd.present()) {
-			if(expireEndVersion <= expiredEnd.get()) {
-				// If the expire request is to the version already expired to then there is no work to do so return true
-				return Void();
-			}
-			scanBegin = expiredEnd.get();
-		}
+		// Start scan for files to delete at the last completed expire operation's end or 0.
+		state Version scanBegin = desc.expiredEndVersion.orDefault(0);
 
-		TraceEvent("BackupContainerFileSystem")
+		TraceEvent("BackupContainerFileSystemExpire2")
+			.detail("URL", bc->getURL())
 			.detail("ExpireEndVersion", expireEndVersion)
-			.detail("ScanBeginVersion", scanBegin)
-			.detail("CachedLogBegin", logBegin.orDefault(-1))
-			.detail("CachedLogEnd", logEnd.orDefault(-1))
-			.detail("CachedExpiredEnd", expiredEnd.orDefault(-1));
+			.detail("RestorableBeginVersion", restorableBeginVersion)
+			.detail("ScanBeginVersion", scanBegin);
 
-		// Get log files that contain any data at or before expireEndVersion
-		state std::vector<LogFile> logs = wait(bc->listLogFiles(scanBegin, expireEndVersion - 1));
-		// Get range files up to and including expireEndVersion
-		state std::vector<RangeFile> ranges = wait(bc->listRangeFiles(scanBegin, expireEndVersion - 1));
+		state std::vector<LogFile> logs;
+		state std::vector<RangeFile> ranges;
+
+		if(progress != nullptr) {
+			progress->step = "Listing files";
+		}
+		// Get log files or range files that contain any data at or before expireEndVersion
+		wait(store(logs, bc->listLogFiles(scanBegin, expireEndVersion - 1)) && store(ranges, bc->listRangeFiles(scanBegin, expireEndVersion - 1)));
 
 		// The new logBeginVersion will be taken from the last log file, if there is one
 		state Optional<Version> newLogBeginVersion;
 		if(!logs.empty()) {
-			LogFile &last = logs.back();
+			// Linear scan the unsorted logs to find the latest one in sorted order
+			LogFile &last = *std::max_element(logs.begin(), logs.end());
+
 			// If the last log ends at expireEndVersion then that will be the next log begin
 			if(last.endVersion == expireEndVersion) {
 				newLogBeginVersion = expireEndVersion;
 			}
 			else {
 				// If the last log overlaps the expiredEnd then use the log's begin version and move the expiredEnd
-				// back to match it.
+				// back to match it and keep the last log file
 				if(last.endVersion > expireEndVersion) {
 					newLogBeginVersion = last.beginVersion;
-					logs.pop_back();
+
+					// Instead of modifying this potentially very large vector, just clear LogFile
+					last = LogFile();
+
 					expireEndVersion = newLogBeginVersion.get();
 				}
 			}
@@ -699,7 +926,10 @@ public:
 
 		// Move filenames out of vector then destroy it to save memory
 		for(auto const &f : logs) {
-			toDelete.push_back(std::move(f.fileName));
+			// We may have cleared the last log file earlier so skip any empty filenames
+			if(!f.fileName.empty()) {
+				toDelete.push_back(std::move(f.fileName));
+			}
 		}
 		logs.clear();
 
@@ -720,37 +950,21 @@ public:
 		}
 		desc = BackupDescription();
 
-		// If some files to delete were found AND force is needed AND the force option is NOT set, then fail
-		if(!toDelete.empty() && forceNeeded && !force)
-			throw backup_cannot_expire();
-
-		// We are about to start deleting files, at which point no data prior to the expire end version can be 
-		// safely assumed to exist. The [logBegin, logEnd) range from the container's metadata describes
-		// a range of log versions which can be assumed to exist, so if the range of data being deleted overlaps
-		// that range then the metadata range must be updated.
-
-		// If we're expiring the entire log range described by the metadata then clear both metadata values
-		if(logEnd.present() && logEnd.get() < expireEndVersion) {
-			if(logBegin.present())
-				wait(bc->logBeginVersion().clear());
-			if(logEnd.present())
-				wait(bc->logEndVersion().clear());
+		// We are about to start deleting files, at which point all data prior to expireEndVersion is considered
+		// 'unreliable' as some or all of it will be missing.  So before deleting anything, read unreliableEndVersion
+		// (don't use cached value in desc) and update its value if it is missing or < expireEndVersion
+		if(progress != nullptr) {
+			progress->step = "Initial metadata update";
 		}
-		else {
-			// If we are expiring to a point within the metadata range then update the begin if we have a new
-			// log begin version (which we should!) or clear the metadata range if we do not (which would be
-			// repairing the metadata from an incorrect state)
-			if(logBegin.present() && logBegin.get() < expireEndVersion) {
-				if(newLogBeginVersion.present()) {
-					wait(bc->logBeginVersion().set(newLogBeginVersion.get()));
-				}
-				else {
-					if(logBegin.present())
-						wait(bc->logBeginVersion().clear());
-					if(logEnd.present())
-						wait(bc->logEndVersion().clear());
-				}
-			}
+		Optional<Version> metaUnreliableEnd = wait(bc->unreliableEndVersion().get());
+		if(metaUnreliableEnd.orDefault(0) < expireEndVersion) {
+			wait(bc->unreliableEndVersion().set(expireEndVersion));
+		}
+
+		if(progress != nullptr) {
+			progress->step = "Deleting files";
+			progress->total = toDelete.size();
+			progress->done = 0;
 		}
 
 		// Delete files, but limit parallelism because the file list could use a lot of memory and the corresponding
@@ -772,19 +986,30 @@ public:
 
 			while(deleteFutures.size() > targetFuturesSize) {
 				wait(deleteFutures.front());
+				if(progress != nullptr) {
+					++progress->done;
+				}
 				deleteFutures.pop_front();
 			}
 		}
 
-		// Update the expiredEndVersion property.
-		wait(bc->expiredEndVersion().set(expireEndVersion));
+		if(progress != nullptr) {
+			progress->step = "Final metadata update";
+			progress->total = 0;
+		}
+		// Update the expiredEndVersion metadata to indicate that everything prior to that version has been
+		// successfully deleted if the current version is lower or missing
+		Optional<Version> metaExpiredEnd = wait(bc->expiredEndVersion().get());
+		if(metaExpiredEnd.orDefault(0) < expireEndVersion) {
+			wait(bc->expiredEndVersion().set(expireEndVersion));
+		}
 
 		return Void();
 	}
 
 	// Delete all data up to (but not including endVersion)
-	Future<Void> expireData(Version expireEndVersion, bool force, Version restorableBeginVersion) {
-		return expireData_impl(Reference<BackupContainerFileSystem>::addRef(this), expireEndVersion, force, restorableBeginVersion);
+	Future<Void> expireData(Version expireEndVersion, bool force, ExpireProgress *progress, Version restorableBeginVersion) {
+		return expireData_impl(Reference<BackupContainerFileSystem>::addRef(this), expireEndVersion, force, progress, restorableBeginVersion);
 	}
 
 	ACTOR static Future<Optional<RestorableFileSet>> getRestoreSet_impl(Reference<BackupContainerFileSystem> bc, Version targetVersion) {
@@ -808,7 +1033,10 @@ public:
 			if(snapshot.get().beginVersion == snapshot.get().endVersion && snapshot.get().endVersion == targetVersion)
 				return Optional<RestorableFileSet>(restorable);
 
-			std::vector<LogFile> logs = wait(bc->listLogFiles(snapshot.get().beginVersion, targetVersion));
+			state std::vector<LogFile> logs = wait(bc->listLogFiles(snapshot.get().beginVersion, targetVersion));
+
+			// List logs in version order so log continuity can be analyzed
+			std::sort(logs.begin(), logs.end());
 
 			// If there are logs and the first one starts at or before the snapshot begin version then proceed
 			if(!logs.empty() && logs.front().beginVersion <= snapshot.get().beginVersion) {
@@ -858,18 +1086,19 @@ private:
 
 public:
 	// To avoid the need to scan the underyling filesystem in many cases, some important version boundaries are stored in named files.
-	// These files can be deleted from the filesystem if they appear to be wrong or corrupt, and full scans will done
-	// when needed.
+	// These versions also indicate what version ranges are known to be deleted or partially deleted.
 	//
-	// The three versions below, when present, describe 4 version ranges which collectively cover the entire version timeline.
-	//                   0 -   expiredEndVersion:  All files in this range have been deleted
-	//   expiredEndVersion - presentBeginVersion:  Files in this range *may* have been deleted so their presence must not be assumed.
-	// presentBeginVersion -   presentEndVersion:  Files in this range have NOT been deleted by any FDB backup operations.
-	//   presentEndVersion -            infinity:  Files in this range may or may not exist yet.  Scan to find what is there.
+	// The values below describe version ranges as follows:
+	//                   0 - expiredEndVersion      All files in this range have been deleted
+	//   expiredEndVersion - unreliableEndVersion   Some files in this range may have been deleted.
+	//
+	//   logBeginVersion   - logEnd                 Log files are contiguous in this range and have NOT been deleted by fdbbackup
+	//   logEnd            - infinity               Files in this range may or may not exist yet
 	//
 	VersionProperty logBeginVersion() { return {Reference<BackupContainerFileSystem>::addRef(this), "log_begin_version"}; }
 	VersionProperty logEndVersion() {   return {Reference<BackupContainerFileSystem>::addRef(this), "log_end_version"}; }
 	VersionProperty expiredEndVersion() {   return {Reference<BackupContainerFileSystem>::addRef(this), "expired_end_version"}; }
+	VersionProperty unreliableEndVersion() {   return {Reference<BackupContainerFileSystem>::addRef(this), "unreliable_end_version"}; }
 
 	ACTOR static Future<Void> writeVersionProperty(Reference<BackupContainerFileSystem> bc, std::string path, Version v) {
 		try {
@@ -879,7 +1108,10 @@ public:
 			wait(f->finish());
 			return Void();
 		} catch(Error &e) {
-			TraceEvent(SevWarn, "BackupContainerWritePropertyFailed").error(e).detail("Path", path);
+			TraceEvent(SevWarn, "BackupContainerWritePropertyFailed")
+				.error(e)
+				.detail("URL", bc->getURL())
+				.detail("Path", path);
 			throw;
 		}
 	}
@@ -896,12 +1128,20 @@ public:
 			if(rs == size && sscanf(s.c_str(), "%lld%n", &v, &len) == 1 && len == size)
 				return v;
 
-			TraceEvent(SevWarn, "BackupContainerInvalidProperty");
+			TraceEvent(SevWarn, "BackupContainerInvalidProperty")
+				.detail("URL", bc->getURL())
+				.detail("Path", path);
+
 			throw backup_invalid_info();
 		} catch(Error &e) {
 			if(e.code() == error_code_file_not_found)
 				return Optional<Version>();
-			TraceEvent(SevWarn, "BackupContainerReadPropertyFailed").error(e).detail("Path", path);
+
+			TraceEvent(SevWarn, "BackupContainerReadPropertyFailed")
+				.error(e)
+				.detail("URL", bc->getURL())
+				.detail("Path", path);
+
 			throw;
 		}
 	}
@@ -968,6 +1208,11 @@ public:
 		return Void();
 	}
 
+	// The container exists if the folder it resides in exists
+	Future<bool> exists() {
+		return directoryExists(m_path);
+	}
+
 	Future<Reference<IAsyncFile>> readFile(std::string path) {
 		int flags = IAsyncFile::OPEN_NO_AIO | IAsyncFile::OPEN_READONLY | IAsyncFile::OPEN_UNCACHED;
 		// Simulation does not properly handle opening the same file from multiple machines using a shared filesystem,
@@ -987,7 +1232,31 @@ public:
 		// can't be used because backup files are read-only.  Cached mode can only help during restore task retries handled
 		// by the same process that failed the first task execution anyway, which is a very rare case.
 		#endif
-		return IAsyncFileSystem::filesystem()->open(fullPath, flags, 0644);
+		Future<Reference<IAsyncFile>> f = IAsyncFileSystem::filesystem()->open(fullPath, flags, 0644);
+
+		if(g_network->isSimulated()) {
+			int blockSize = 0;
+			// Extract block size from the filename, if present
+			size_t lastComma = path.find_last_of(',');
+			if(lastComma != path.npos) {
+				blockSize = atoi(path.substr(lastComma + 1).c_str());
+			}
+			if(blockSize <= 0) {
+				blockSize = g_random->randomInt(1e4, 1e6);
+			}
+			if(g_random->random01() < .01) {
+				blockSize /= g_random->randomInt(1, 3);
+			}
+
+			return map(f, [=](Reference<IAsyncFile> fr) {
+				int readAhead = g_random->randomInt(0, 3);
+				int reads = g_random->randomInt(1, 3);
+				int cacheSize = g_random->randomInt(0, 3);
+				return Reference<IAsyncFile>(new AsyncFileReadAheadCache(fr, blockSize, readAhead, reads, cacheSize));
+			});
+		}
+
+		return f;
 	}
 
 	class BackupFile : public IBackupFile, ReferenceCounted<BackupFile> {
@@ -1060,7 +1329,7 @@ public:
 	Future<Void> deleteContainer(int *pNumDeleted) {
 		// In order to avoid deleting some random directory due to user error, first describe the backup
 		// and make sure it has something in it.
-		return map(describeBackup(), [=](BackupDescription const &desc) {
+		return map(describeBackup(false, invalidVersion), [=](BackupDescription const &desc) {
 			// If the backup has no snapshots and no logs then it's probably not a valid backup
 			if(desc.snapshots.size() == 0 && !desc.minLogBegin.present())
 				throw backup_invalid_url();
@@ -1112,6 +1381,7 @@ public:
 				continue;
 			}
 			TraceEvent(SevWarn, "BackupContainerBlobStoreInvalidParameter").detail("Name", printable(kv.first)).detail("Value", printable(kv.second));
+			IBackupContainer::lastOpenError = format("Unknown URL parameter: '%s'", kv.first.c_str());
 			throw backup_invalid_url();
 		}
 	}
@@ -1142,7 +1412,7 @@ public:
 		BlobStoreEndpoint::ListResult contents = wait(bstore->listBucket(bucket, basePath));
 		std::vector<std::string> results;
 		for(auto &f : contents.objects) {
-			results.push_back(bstore->getResourceURL(f.name.substr(basePath.size())));
+			results.push_back(bstore->getResourceURL(f.name.substr(basePath.size()), format("bucket=%s", bucket.c_str())));
 		}
 		return results;
 	}
@@ -1214,7 +1484,18 @@ public:
 		return create_impl(Reference<BackupContainerBlobStore>::addRef(this));
 	}
 
+	// The container exists if the index entry in the blob bucket exists
+	Future<bool> exists() {
+		return m_bstore->objectExists(m_bucket, indexEntry());
+	}
+
 	ACTOR static Future<Void> deleteContainer_impl(Reference<BackupContainerBlobStore> bc, int *pNumDeleted) {
+		bool e = wait(bc->exists());
+		if(!e) {
+			TraceEvent(SevWarnAlways, "BackupContainerDoesNotExist").detail("URL", bc->getURL());
+			throw backup_does_not_exist();
+		}
+
 		// First delete everything under the data prefix in the bucket
 		wait(bc->m_bstore->deleteRecursively(bc->m_bucket, bc->dataPath(""), pNumDeleted));
 
@@ -1284,10 +1565,12 @@ Reference<IBackupContainer> IBackupContainer::openContainer(std::string url)
 			throw;
 
 		TraceEvent m(SevWarn, "BackupContainer");
-		m.detail("Description", "Invalid container specification.  See help.").detail("URL", url);
-
+		m.detail("Description", "Invalid container specification.  See help.");
+		m.detail("URL", url);
+		m.error(e);
 		if(e.code() == error_code_backup_invalid_url)
 			m.detail("LastOpenError", lastOpenError);
+
 		throw;
 	}
 }
@@ -1328,10 +1611,13 @@ ACTOR Future<std::vector<std::string>> listContainers_impl(std::string baseURL) 
 			throw;
 
 		TraceEvent m(SevWarn, "BackupContainer");
-		m.detail("Description", "Invalid backup container URL prefix.  See help.").detail("URL", baseURL);
-
+		
+		m.detail("Description", "Invalid backup container URL prefix.  See help.");
+		m.detail("URL", baseURL);
+		m.error(e);
 		if(e.code() == error_code_backup_invalid_url)
 			m.detail("LastOpenError", IBackupContainer::lastOpenError);
+
 		throw;
 	}
 }
@@ -1344,20 +1630,11 @@ ACTOR Future<Version> timeKeeperVersionFromDatetime(std::string datetime, Databa
 	state KeyBackedMap<int64_t, Version> versionMap(timeKeeperPrefixRange.begin);
 	state Reference<ReadYourWritesTransaction> tr = Reference<ReadYourWritesTransaction>(new ReadYourWritesTransaction(db));
 
-	int year, month, day, hour, minute, second;
-	if (sscanf(datetime.c_str(), "%d-%d-%d.%d:%d:%d", &year, &month, &day, &hour, &minute, &second) != 6) {
-		fprintf(stderr, "ERROR: Incorrect date/time format.\n");
+	state int64_t time = BackupAgentBase::parseTime(datetime);
+	if(time < 0) {
+		fprintf(stderr, "ERROR: Incorrect date/time or format.  Format is %s.\n", BackupAgentBase::timeFormat().c_str());
 		throw backup_error();
 	}
-	struct tm expDateTime = {0};
-	expDateTime.tm_year = year - 1900;
-	expDateTime.tm_mon = month - 1;
-	expDateTime.tm_mday = day;
-	expDateTime.tm_hour = hour;
-	expDateTime.tm_min = minute;
-	expDateTime.tm_sec = second;
-	expDateTime.tm_isdst = -1;
-	state int64_t time = (int64_t) mktime(&expDateTime);
 
 	loop {
 		try {
@@ -1367,7 +1644,7 @@ ACTOR Future<Version> timeKeeperVersionFromDatetime(std::string datetime, Databa
 			if (results.size() != 1) {
 				// No key less than time was found in the database
 				// Look for a key >= time.
-				wait( store( versionMap.getRange(tr, time, std::numeric_limits<int64_t>::max(), 1), results) );
+				wait( store( results, versionMap.getRange(tr, time, std::numeric_limits<int64_t>::max(), 1) ) );
 
 				if(results.size() != 1) {
 					fprintf(stderr, "ERROR: Unable to calculate a version for given date/time.\n");
@@ -1407,7 +1684,7 @@ ACTOR Future<Optional<int64_t>> timeKeeperEpochsFromVersion(Version v, Reference
 			if(mid == min) {
 				// There aren't any records having a version < v, so just look for any record having a time < now
 				// and base a result on it
-				wait(store(versionMap.getRange(tr, 0, (int64_t)now(), 1), results));
+				wait(store(results, versionMap.getRange(tr, 0, (int64_t)now(), 1)));
 
 				if (results.size() != 1) {
 					// There aren't any timekeeper records to base a result on so return nothing
@@ -1484,7 +1761,7 @@ ACTOR Future<Void> testBackupContainer(std::string url) {
 	try {
 		wait(c->deleteContainer());
 	} catch(Error &e) {
-		if(e.code() != error_code_backup_invalid_url)
+		if(e.code() != error_code_backup_invalid_url && e.code() != error_code_backup_does_not_exist)
 			throw;
 	}
 
@@ -1548,7 +1825,7 @@ ACTOR Future<Void> testBackupContainer(std::string url) {
 
 	wait(waitForAll(writes));
 
-	state FullBackupListing listing = wait(c->dumpFileList());
+	state BackupFileList listing = wait(c->dumpFileList());
 	ASSERT(listing.ranges.size() == nRangeFiles);
 	ASSERT(listing.logs.size() == logs.size());
 	ASSERT(listing.snapshots.size() == snapshots.size());
@@ -1559,13 +1836,17 @@ ACTOR Future<Void> testBackupContainer(std::string url) {
 	// Do a series of expirations and verify resulting state
 	state int i = 0;
 	for(; i < listing.snapshots.size(); ++i) {
-		// Ensure we can still restore to the latest version
-		Optional<RestorableFileSet> rest = wait(c->getRestoreSet(desc.maxRestorableVersion.get()));
-		ASSERT(rest.present());
+		{
+			// Ensure we can still restore to the latest version
+			Optional<RestorableFileSet> rest = wait(c->getRestoreSet(desc.maxRestorableVersion.get()));
+			ASSERT(rest.present());
+		}
 
-		// Ensure we can restore to the end version of snapshot i
-		Optional<RestorableFileSet> rest = wait(c->getRestoreSet(listing.snapshots[i].endVersion));
-		ASSERT(rest.present());
+		{
+			// Ensure we can restore to the end version of snapshot i
+			Optional<RestorableFileSet> rest = wait(c->getRestoreSet(listing.snapshots[i].endVersion));
+			ASSERT(rest.present());
+		}
 
 		// Test expiring to the end of this snapshot
 		state Version expireVersion = listing.snapshots[i].endVersion;
@@ -1589,12 +1870,11 @@ ACTOR Future<Void> testBackupContainer(std::string url) {
 	printf("DELETING\n");
 	wait(c->deleteContainer());
 
-	BackupDescription d = wait(c->describeBackup());
-	printf("\n%s\n", d.toString().c_str());
-	ASSERT(d.snapshots.size() == 0);
-	ASSERT(!d.minLogBegin.present());
+	state Future<BackupDescription> d = c->describeBackup();
+	wait(ready(d));
+	ASSERT(d.isError() && d.getError().code() == error_code_backup_does_not_exist);
 
-	FullBackupListing empty = wait(c->dumpFileList());
+	BackupFileList empty = wait(c->dumpFileList());
 	ASSERT(empty.ranges.size() == 0);
 	ASSERT(empty.logs.size() == 0);
 	ASSERT(empty.snapshots.size() == 0);
